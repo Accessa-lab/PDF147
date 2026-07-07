@@ -630,6 +630,36 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     flex-direction: column;
     gap: 10px;
   }
+
+  .cat-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: rgba(0,200,120,0.07);
+    border: 1px solid rgba(0,200,120,0.18);
+    border-radius: 10px;
+    margin-top: 6px;
+  }
+
+  .cat-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--accent);
+    letter-spacing: 1px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .cat-count {
+    background: rgba(0,200,120,0.15);
+    color: var(--accent);
+    font-family: 'Space Mono', monospace;
+    font-size: 0.65rem;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-weight: 700;
+  }
 </style>
 </head>
 <body>
@@ -719,12 +749,77 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 let codeReader = null;
 let scanning = false;
 let records = [];
+let lastScannedText = null;
+let cooldown = false;           // evita doble-disparo del mismo frame
 
 // Load from localStorage
 try {
   const saved = localStorage.getItem('pdf417_records');
   if (saved) records = JSON.parse(saved);
 } catch(e) {}
+
+// ─── AUDIO ENGINE ────────────────────────────────────
+const _ac = new (window.AudioContext || window.webkitAudioContext)();
+
+function playBeep(type) {
+  // type: 'ok' | 'error'
+  const now = _ac.currentTime;
+  if (type === 'ok') {
+    // Dos tonos ascendentes (aprobación)
+    [880, 1320].forEach((freq, i) => {
+      const o = _ac.createOscillator();
+      const g = _ac.createGain();
+      o.connect(g); g.connect(_ac.destination);
+      o.type = 'sine';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(0, now + i * 0.12);
+      g.gain.linearRampToValueAtTime(0.35, now + i * 0.12 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.12 + 0.18);
+      o.start(now + i * 0.12);
+      o.stop(now + i * 0.12 + 0.2);
+    });
+  } else {
+    // Tono descendente + stutter (error/rechazo)
+    [520, 320].forEach((freq, i) => {
+      const o = _ac.createOscillator();
+      const g = _ac.createGain();
+      o.connect(g); g.connect(_ac.destination);
+      o.type = 'square';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(0, now + i * 0.13);
+      g.gain.linearRampToValueAtTime(0.25, now + i * 0.13 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.13 + 0.15);
+      o.start(now + i * 0.13);
+      o.stop(now + i * 0.13 + 0.18);
+    });
+  }
+  // Desbloquea AudioContext en iOS
+  if (_ac.state === 'suspended') _ac.resume();
+}
+
+// ─── TIPO DE DOCUMENTO ───────────────────────────────
+function detectDocumentType(text, format) {
+  const fmt = (ZXing && ZXing.BarcodeFormat) ? (ZXing.BarcodeFormat[format] || String(format)) : String(format);
+  if (fmt === 'QR_CODE') return 'QR';
+  if (fmt === 'CODE_128' || fmt === 'CODE_39' || fmt === 'EAN_13' || fmt === 'ITF') return 'BARRAS';
+  // PDF417 → distinguir cédula antigua vs nueva
+  if (fmt === 'PDF_417') {
+    // Cédula nueva (post-2000): binaria / MRZ → contiene caracteres no-ASCII o patrón MRZ
+    const hasBinary = /[\x00-\x08\x0e-\x1f\x80-\xff]/.test(text);
+    const hasMRZ = /^[A-Z0-9<]{30,}/.test(text.replace(/\s/g,''));
+    if (hasBinary || hasMRZ) return 'CEDULA_NUEVA';
+    return 'CEDULA_ANTIGUA';
+  }
+  return 'OTRO';
+}
+
+const DOC_TYPE_LABEL = {
+  CEDULA_ANTIGUA : '🪪 Cédula Antigua',
+  CEDULA_NUEVA   : '🆔 Cédula Nueva',
+  QR             : '⬛ QR',
+  BARRAS         : '|||  Código de Barras',
+  OTRO           : '❓ Otro'
+};
 
 // ─── DOM REFS ────────────────────────────────────────
 const video       = document.getElementById('video');
@@ -814,26 +909,45 @@ async function startScanner() {
     return;
   }
 
+  // Desbloquea AudioContext al primer gesto del usuario
+  if (_ac.state === 'suspended') _ac.resume();
+
   scanning = true;
+  cooldown = false;
   btnStart.disabled = true;
   btnStop.disabled = false;
   scanLine.classList.add('active');
-  setStatus('scanning', 'Escaneando... apunta al código PDF417');
+  setStatus('scanning', 'Escaneando...');
 
   const deviceId = camSelect.value;
-  const hints = new Map();
-  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.PDF_417]);
-  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
 
-  codeReader = new ZXing.BrowserMultiFormatReader(hints);
+  // Formatos soportados: PDF417 + QR + barras más comunes
+  const hints = new Map();
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+    ZXing.BarcodeFormat.PDF_417,
+    ZXing.BarcodeFormat.QR_CODE,
+    ZXing.BarcodeFormat.CODE_128,
+    ZXing.BarcodeFormat.CODE_39,
+    ZXing.BarcodeFormat.EAN_13,
+    ZXing.BarcodeFormat.ITF,
+    ZXing.BarcodeFormat.DATA_MATRIX
+  ]);
+  // TRY_HARDER = false → más rápido; el lector actúa frame a frame
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, false);
+
+  codeReader = new ZXing.BrowserMultiFormatReader(hints, 200); // timeBetweenScans = 200 ms
+
+  // Constraints de alta resolución para mayor velocidad de detección
+  const videoConstraints = deviceId
+    ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
+    : { facingMode: 'environment',    width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
 
   try {
-    const constraints = deviceId
-      ? { deviceId: { exact: deviceId } }
-      : { facingMode: 'environment' };
-
-    await codeReader.decodeFromConstraints({ video: constraints }, video, (result, err) => {
-      if (result) onDecoded(result);
+    await codeReader.decodeFromConstraints({ video: videoConstraints }, video, (result, err) => {
+      if (result && !cooldown) {
+        cooldown = true;
+        onDecoded(result);
+      }
     });
   } catch (e) {
     setStatus('error', 'Error de cámara: ' + e.message);
@@ -859,25 +973,44 @@ function stopScanner() {
 
 // ─── DECODE HANDLER ──────────────────────────────────
 function onDecoded(result) {
-  const text = result.getText();
-  const format = result.getBarcodeFormat();
-  const formatName = ZXing.BarcodeFormat[format] || 'DESCONOCIDO';
+  const text    = result.getText();
+  const format  = result.getBarcodeFormat();
+  const fmtName = ZXing.BarcodeFormat[format] || 'DESCONOCIDO';
+  const docType = detectDocumentType(text, format);
 
+  // ── Validación básica ──────────────────────────────
+  const parsed = parseColombian(text, docType);
+  const isValid = !!(parsed.numeroCedula || text.trim().length > 3);
+
+  if (!isValid) {
+    // Lectura inválida → sonido de error + reinicio automático
+    playBeep('error');
+    setStatus('error', '⚠ Lectura inválida — reintentando...');
+    setTimeout(() => {
+      cooldown = false;
+      if (scanning) setStatus('scanning', 'Escaneando...');
+    }, 900);
+    return;
+  }
+
+  // ── Lectura correcta ──────────────────────────────
   stopScanner();
+
+  playBeep('ok');
 
   cameraWrap.classList.add('found-flash');
   setTimeout(() => cameraWrap.classList.remove('found-flash'), 600);
 
-  setStatus('found', '✓ Código detectado: ' + formatName);
-  document.getElementById('formatBadge').textContent = formatName;
+  setStatus('found', `✓ ${DOC_TYPE_LABEL[docType]} detectado`);
+  document.getElementById('formatBadge').textContent = DOC_TYPE_LABEL[docType];
 
   rawDataEl.textContent = text;
-  const parsed = buildTable(text);
+  buildTable(text, docType, parsed);
   resultCard.classList.add('visible');
   resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
-  // Save to records
-  saveRecord(text, parsed);
+  // Guardado INMEDIATO antes de cualquier render adicional
+  saveRecord(text, parsed, docType);
 }
 
 // ─── PARSE COLOMBIAN ID ───────────────────────────────
@@ -900,7 +1033,10 @@ function onDecoded(result) {
   The exact positions can vary depending on generation of card.
   We try multiple strategies.
 */
-function parseColombian(text) {
+function parseColombian(text, docType) {
+  if (docType === 'QR' || docType === 'BARRAS' || docType === 'OTRO') {
+    return { raw: text };
+  }
   // Normalize separators
   const raw = text.trim();
 
@@ -1030,10 +1166,10 @@ function parseColombian(text) {
 }
 
 // Build the parsed result table
-function buildTable(text) {
+function buildTable(text, docType, info) {
   dataTable.innerHTML = '';
 
-  const info = parseColombian(text);
+  if (!info) info = parseColombian(text, docType);
 
   const addRow = (label, value) => {
     if (!value) return;
@@ -1076,15 +1212,17 @@ function copyRaw() {
 }
 
 // ─── RECORDS ─────────────────────────────────────────
-function saveRecord(rawText, info) {
+function saveRecord(rawText, info, docType) {
   const now = new Date();
   const rec = {
     id: Date.now(),
     timestamp: now.toLocaleString('es-CO'),
     raw: rawText,
+    docType: docType || 'OTRO',
     ...info
   };
   records.unshift(rec);
+  // Guardado INMEDIATO
   persistRecords();
   renderRecords();
 }
@@ -1095,11 +1233,14 @@ function persistRecords() {
   } catch(e) {}
 }
 
+// Orden de categorías en la UI
+const CAT_ORDER = ['CEDULA_NUEVA','CEDULA_ANTIGUA','QR','BARRAS','OTRO'];
+
 function renderRecords() {
-  const list = document.getElementById('recordsList');
-  const empty = document.getElementById('emptyMsg');
-  const count = document.getElementById('recordsCount');
-  const badge = document.getElementById('recBadge');
+  const list      = document.getElementById('recordsList');
+  const empty     = document.getElementById('emptyMsg');
+  const count     = document.getElementById('recordsCount');
+  const badge     = document.getElementById('recBadge');
   const exportBtn = document.getElementById('btnExport');
 
   badge.textContent = records.length;
@@ -1114,42 +1255,67 @@ function renderRecords() {
   }
 
   empty.style.display = 'none';
-
-  // Rebuild list
   list.innerHTML = '';
 
-  records.forEach((rec, idx) => {
-    const num = records.length - idx;
-    const nameDisplay = [rec.nombres, rec.apellidos].filter(Boolean).join(' ') || 'Lectura sin nombre';
-    const idDisplay = rec.numeroCedula || '';
+  // Agrupar por categoría
+  const groups = {};
+  records.forEach(rec => {
+    const cat = rec.docType || 'OTRO';
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(rec);
+  });
 
-    const item = document.createElement('div');
-    item.className = 'record-item';
-    item.innerHTML = `
-      <div class="record-item-header" onclick="toggleRecord(this)">
-        <span class="record-num">#${String(num).padStart(3,'0')}</span>
-        <span class="record-name">${nameDisplay}</span>
-        <span class="record-id">${idDisplay}</span>
-        <span class="record-time">${rec.timestamp}</span>
-        <span class="chevron">▾</span>
-      </div>
-      <div class="record-body">
-        <table class="record-table">
-          ${recRow('N° Identidad',      rec.numeroCedula)}
-          ${recRow('Apellidos',         rec.apellidos)}
-          ${recRow('Nombres',           rec.nombres)}
-          ${recRow('F. Nacimiento',     rec.fechaNacimiento)}
-          ${recRow('L. Nacimiento',     rec.lugarNacimiento)}
-          ${recRow('Estatura',          rec.estatura)}
-          ${recRow('G.S. / RH',        rec.gsRh)}
-          ${recRow('Sexo',              rec.sexo)}
-          ${recRow('F. Expedición',     rec.fechaExpedicion)}
-          ${recRow('L. Expedición',     rec.lugarExpedicion)}
-          ${recRow('Escaneado',         rec.timestamp)}
-        </table>
-      </div>
+  // Numeración global descendente
+  let globalNum = records.length;
+
+  CAT_ORDER.forEach(cat => {
+    const grp = groups[cat];
+    if (!grp || grp.length === 0) return;
+
+    // Encabezado de categoría
+    const catHeader = document.createElement('div');
+    catHeader.className = 'cat-header';
+    catHeader.innerHTML = `
+      <span class="cat-label">${DOC_TYPE_LABEL[cat]}</span>
+      <span class="cat-count">${grp.length}</span>
     `;
-    list.appendChild(item);
+    list.appendChild(catHeader);
+
+    grp.forEach(rec => {
+      const num = globalNum--;
+      const nameDisplay = [rec.nombres, rec.apellidos].filter(Boolean).join(' ') || rec.raw || 'Lectura';
+      const idDisplay   = rec.numeroCedula || '';
+
+      const item = document.createElement('div');
+      item.className = 'record-item';
+      item.innerHTML = `
+        <div class="record-item-header" onclick="toggleRecord(this)">
+          <span class="record-num">#${String(num).padStart(3,'0')}</span>
+          <span class="record-name">${nameDisplay}</span>
+          <span class="record-id">${idDisplay}</span>
+          <span class="record-time">${rec.timestamp}</span>
+          <span class="chevron">▾</span>
+        </div>
+        <div class="record-body">
+          <table class="record-table">
+            ${recRow('Tipo',             DOC_TYPE_LABEL[rec.docType] || '')}
+            ${recRow('N° Identidad',     rec.numeroCedula)}
+            ${recRow('Apellidos',        rec.apellidos)}
+            ${recRow('Nombres',          rec.nombres)}
+            ${recRow('F. Nacimiento',    rec.fechaNacimiento)}
+            ${recRow('L. Nacimiento',    rec.lugarNacimiento)}
+            ${recRow('Estatura',         rec.estatura)}
+            ${recRow('G.S. / RH',       rec.gsRh)}
+            ${recRow('Sexo',             rec.sexo)}
+            ${recRow('F. Expedición',    rec.fechaExpedicion)}
+            ${recRow('L. Expedición',    rec.lugarExpedicion)}
+            ${recRow('Dato raw',         (rec.raw && rec.raw.length < 120) ? rec.raw : null)}
+            ${recRow('Escaneado',        rec.timestamp)}
+          </table>
+        </div>
+      `;
+      list.appendChild(item);
+    });
   });
 }
 
